@@ -117,9 +117,14 @@ func (f *f5Frontend) fetchTunnelConfiguration(
 	if optionsErr != nil {
 		return nil, optionsErr
 	}
-	configuration, parseOptionsErr := parseF5Options(optionsBody, snapshot.authenticationExpiration)
+	configuration, warnings, parseOptionsErr := parseF5Options(optionsBody, snapshot.authenticationExpiration)
 	if parseOptionsErr != nil {
 		return nil, markTerminal(parseOptionsErr)
+	}
+	for _, warning := range warnings {
+		if f.client.options.Logger != nil {
+			f.client.options.Logger.WarnContext(f.client.options.Context, warning)
+		}
 	}
 	if f.client.options.IPv6Disabled {
 		configuration.wantIPv6 = false
@@ -216,18 +221,21 @@ func parseF5Profile(content []byte) (string, error) {
 	return "", E.New("VPN profile has no favorite parameters")
 }
 
-func parseF5Options(content []byte, authenticationExpiration time.Time) (*f5TunnelConfiguration, error) {
+// Optional values the client cannot parse are dropped with a warning, as
+// openconnect does, rather than failing the connection; values that decide
+// framing, address families or the default route stay strict.
+func parseF5Options(content []byte, authenticationExpiration time.Time) (*f5TunnelConfiguration, []string, error) {
 	structureErr := validateF5OptionsStructure(content)
 	if structureErr != nil {
-		return nil, structureErr
+		return nil, nil, structureErr
 	}
 	var document f5OptionsDocument
 	decodeErr := xml.Unmarshal(bytes.TrimSpace(content), &document)
 	if decodeErr != nil {
-		return nil, E.Cause(decodeErr, "decode F5 VPN options XML")
+		return nil, nil, E.Cause(decodeErr, "decode F5 VPN options XML")
 	}
 	if document.XMLName.Local != "favorite" || len(document.Objects) == 0 {
-		return nil, E.New("VPN options has no favorite object")
+		return nil, nil, E.New("VPN options has no favorite object")
 	}
 	configuration := &f5TunnelConfiguration{
 		configuration: TunnelConfiguration{
@@ -239,6 +247,7 @@ func parseF5Options(content []byte, authenticationExpiration time.Time) (*f5Tunn
 	dtlsAdvertised := false
 	var dnsCount int
 	var nbnsCount int
+	var warnings []string
 	for _, field := range document.Objects[0].Fields {
 		name := field.XMLName.Local
 		value := strings.TrimSpace(field.Value)
@@ -250,34 +259,33 @@ func parseF5Options(content []byte, authenticationExpiration time.Time) (*f5Tunn
 		case "IPV4_0":
 			parsed, parseErr := parseF5Boolean(value)
 			if parseErr != nil {
-				return nil, E.Cause(parseErr, "parse F5 IPv4 enablement")
+				return nil, nil, E.Cause(parseErr, "parse F5 IPv4 enablement")
 			}
 			configuration.wantIPv4 = parsed
 		case "IPV6_0":
 			parsed, parseErr := parseF5Boolean(value)
 			if parseErr != nil {
-				return nil, E.Cause(parseErr, "parse F5 IPv6 enablement")
+				return nil, nil, E.Cause(parseErr, "parse F5 IPv6 enablement")
 			}
 			configuration.wantIPv6 = parsed
 		case "hdlc_framing":
 			parsed, parseErr := parseF5Boolean(value)
 			if parseErr != nil {
-				return nil, E.Cause(parseErr, "parse F5 HDLC enablement")
+				return nil, nil, E.Cause(parseErr, "parse F5 HDLC enablement")
 			}
 			configuration.hdlc = parsed
 		case "idle_session_timeout":
 			seconds, parseErr := parseF5NonnegativeInteger(value)
-			if parseErr != nil {
-				return nil, E.Cause(parseErr, "parse F5 idle timeout")
-			}
-			if seconds > math.MaxInt64/int64(time.Second) {
-				return nil, E.New("idle timeout exceeds supported duration")
+			if parseErr != nil || seconds > math.MaxInt64/int64(time.Second) {
+				warnings = append(warnings, "ignoring invalid F5 idle timeout: "+value)
+				break
 			}
 			configuration.configuration.IdleTimeout = time.Duration(seconds) * time.Second
 		case "tunnel_dtls":
 			parsed, parseErr := parseF5Boolean(value)
 			if parseErr != nil {
-				return nil, E.Cause(parseErr, "parse F5 DTLS enablement")
+				warnings = append(warnings, "ignoring invalid F5 DTLS enablement: "+value)
+				parsed = false
 			}
 			dtlsAdvertised = parsed
 		case "tunnel_port_dtls":
@@ -287,67 +295,69 @@ func parseF5Options(content []byte, authenticationExpiration time.Time) (*f5Tunn
 			}
 			port, parseErr := strconv.ParseUint(value, 10, 16)
 			if parseErr != nil {
-				return nil, E.New("DTLS port is invalid: ", value)
+				warnings = append(warnings, "ignoring invalid F5 DTLS port: "+value)
+				port = 0
 			}
 			configuration.dtlsPort = uint16(port)
 		case "dtls_v1_2_supported":
 			parsed, parseErr := parseF5Boolean(value)
 			if parseErr != nil {
-				return nil, E.Cause(parseErr, "parse F5 DTLS 1.2 support")
+				warnings = append(warnings, "ignoring invalid F5 DTLS 1.2 support: "+value)
+				parsed = false
 			}
 			configuration.dtls12 = parsed
 		case "UseDefaultGateway0":
 			parsed, parseErr := parseF5Boolean(value)
 			if parseErr != nil {
-				return nil, E.Cause(parseErr, "parse F5 default gateway")
+				return nil, nil, E.Cause(parseErr, "parse F5 default gateway")
 			}
 			defaultRoute = parsed
 		default:
 			switch {
 			case isF5IndexedName(name, "DNS") || isF5IndexedName(name, "DNS6_"):
-				if value != "" && dnsCount < 3 {
-					address, parseErr := netip.ParseAddr(value)
+				for word := range strings.FieldsSeq(value) {
+					address, parseErr := netip.ParseAddr(word)
 					if parseErr != nil {
-						return nil, E.Cause(parseErr, "parse F5 DNS address")
+						warnings = append(warnings, "ignoring invalid F5 DNS address: "+word)
+						continue
 					}
-					configuration.configuration.DNS = append(configuration.configuration.DNS, address.Unmap())
-					dnsCount++
+					if dnsCount < 3 {
+						configuration.configuration.DNS = append(configuration.configuration.DNS, address.Unmap())
+						dnsCount++
+					}
 				}
 			case isF5IndexedName(name, "WINS"):
-				if value != "" && nbnsCount < 3 {
-					address, parseErr := netip.ParseAddr(value)
+				for word := range strings.FieldsSeq(value) {
+					address, parseErr := netip.ParseAddr(word)
 					if parseErr != nil {
-						return nil, E.Cause(parseErr, "parse F5 NBNS address")
+						warnings = append(warnings, "ignoring invalid F5 NBNS address: "+word)
+						continue
 					}
-					configuration.configuration.NBNS = append(configuration.configuration.NBNS, address.Unmap())
-					nbnsCount++
+					if nbnsCount < 3 {
+						configuration.configuration.NBNS = append(configuration.configuration.NBNS, address.Unmap())
+						nbnsCount++
+					}
 				}
 			case isF5IndexedName(name, "DNSSuffix"):
-				if value != "" {
-					configuration.configuration.SearchDomains = append(configuration.configuration.SearchDomains, value)
-				}
+				configuration.configuration.SearchDomains = append(configuration.configuration.SearchDomains, strings.Fields(value)...)
 			case isF5IndexedName(name, "DNS_SPLIT"):
 				configuration.configuration.SplitDNS = append(configuration.configuration.SplitDNS, strings.Fields(value)...)
 			case isF5IndexedName(name, "LAN") || isF5IndexedName(name, "LAN6_"):
-				routes, parseErr := parseF5Routes(value)
-				if parseErr != nil {
-					return nil, E.Cause(parseErr, "parse F5 include routes")
-				}
+				routes, routeWarnings := parseF5Routes(value, "include")
 				configuration.configuration.Routes = append(configuration.configuration.Routes, routes...)
+				warnings = append(warnings, routeWarnings...)
 			case isF5IndexedName(name, "ExcludeSubnets") || isF5IndexedName(name, "ExcludeSubnets6_"):
-				routes, parseErr := parseF5Routes(value)
-				if parseErr != nil {
-					return nil, E.Cause(parseErr, "parse F5 exclude routes")
-				}
+				routes, routeWarnings := parseF5Routes(value, "exclude")
 				configuration.configuration.ExcludedRoutes = append(configuration.configuration.ExcludedRoutes, routes...)
+				warnings = append(warnings, routeWarnings...)
 			}
 		}
 	}
 	if configuration.sessionID == "" || configuration.urZ == "" {
-		return nil, E.New("VPN options is missing Session_ID or ur_Z")
+		return nil, nil, E.New("VPN options is missing Session_ID or ur_Z")
 	}
 	if !configuration.wantIPv4 && !configuration.wantIPv6 {
-		return nil, E.New("VPN options enables no network family")
+		return nil, nil, E.New("VPN options enables no network family")
 	}
 	if defaultRoute {
 		if configuration.wantIPv4 {
@@ -361,7 +371,7 @@ func parseF5Options(content []byte, authenticationExpiration time.Time) (*f5Tunn
 		configuration.configuration.defaultIPv6RouteSuppressed = configuration.wantIPv6
 	}
 	configuration.dtlsEnabled = dtlsAdvertised && configuration.dtlsPort != 0 && !configuration.hdlc
-	return configuration, nil
+	return configuration, warnings, nil
 }
 
 func validateF5OptionsStructure(content []byte) error {
@@ -491,15 +501,36 @@ func isF5IndexedName(name string, prefix string) bool {
 	return name[len(prefix)] >= '0' && name[len(prefix)] <= '9'
 }
 
-func parseF5Routes(value string) ([]TunnelRoute, error) {
+func parseF5Routes(value string, kind string) ([]TunnelRoute, []string) {
 	words := strings.Fields(value)
 	routes := make([]TunnelRoute, 0, len(words))
+	var warnings []string
 	for _, word := range words {
-		prefix, parseErr := netip.ParsePrefix(word)
+		prefix, parseErr := parseF5Prefix(word)
 		if parseErr != nil {
-			return nil, E.Cause(parseErr, "parse F5 route ", word)
+			warnings = append(warnings, "ignoring invalid F5 "+kind+" route "+word+": "+parseErr.Error())
+			continue
 		}
 		routes = append(routes, TunnelRoute{Prefix: prefix.Masked()})
 	}
-	return routes, nil
+	return routes, warnings
+}
+
+func parseF5Prefix(value string) (netip.Prefix, error) {
+	addressText, maskText, hasMask := strings.Cut(value, "/")
+	if !hasMask || !strings.Contains(maskText, ":") {
+		return parseCSTPPrefix(value)
+	}
+	address, addressErr := netip.ParseAddr(addressText)
+	if addressErr != nil {
+		return netip.Prefix{}, addressErr
+	}
+	if !address.Is6() {
+		return netip.Prefix{}, E.New("IPv6 netmask on a non-IPv6 address: ", value)
+	}
+	bits, maskErr := parseIPv6NetmaskBits(maskText)
+	if maskErr != nil {
+		return netip.Prefix{}, maskErr
+	}
+	return netip.PrefixFrom(address, bits), nil
 }
